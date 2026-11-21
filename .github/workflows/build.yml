@@ -18,10 +18,22 @@ jobs:
 
       - name: Get OpenOrbis Toolchain
         run: |
-          git clone --depth=1 \
-            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
-            openorbis
+          URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
+                | grep browser_download_url \
+                | grep -i linux \
+                | cut -d '"' -f 4 \
+                | head -1)
+          echo "Downloading: $URL"
+          curl -L -o toolchain.zip "$URL"
+          unzip -q toolchain.zip -d openorbis_raw
+          FIRST=$(ls openorbis_raw | head -1)
+          if [ -d "openorbis_raw/$FIRST/bin" ]; then
+            mv "openorbis_raw/$FIRST" openorbis
+          else
+            mv openorbis_raw openorbis
+          fi
           chmod +x openorbis/bin/linux/*
+          echo "OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis" >> $GITHUB_ENV
 
       - name: Extract zip
         run: unzip RedAngel_RE.zip
@@ -33,9 +45,7 @@ jobs:
             RedAngel_RE/GoldHEN_Plugins_SDK
 
       - name: Build PRX
-        run: |
-          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
-          make
+        run: make
         working-directory: RedAngel_RE/source
 
       - name: Upload PRX artifact
