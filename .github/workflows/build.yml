@@ -1,0 +1,46 @@
+name: Build RedAngel PRX
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang lld
+
+      - name: Get OpenOrbis Toolchain
+        run: |
+          git clone --depth=1 \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
+            openorbis
+          chmod +x openorbis/bin/linux/*
+
+      - name: Extract zip
+        run: unzip RedAngel_RE.zip
+
+      - name: Clone GoldHEN SDK
+        run: |
+          git clone --depth=1 \
+            https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git \
+            RedAngel_RE/GoldHEN_Plugins_SDK
+
+      - name: Build PRX
+        run: |
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
+          make
+        working-directory: RedAngel_RE/source
+
+      - name: Upload PRX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RedAngel-prx
+          path: RedAngel_RE/source/build/Seren-rebuild.prx
+          if-no-files-found: error
