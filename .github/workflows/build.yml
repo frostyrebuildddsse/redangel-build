@@ -7,35 +7,80 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clang lld
+          sudo apt-get install -y clang lld curl wget unzip python3
 
       - name: Get OpenOrbis Toolchain
         run: |
-          URL=$(curl -s https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
-                | grep browser_download_url \
-                | grep -i linux \
-                | cut -d '"' -f 4 \
-                | head -1)
-          echo "Downloading: $URL"
-          curl -L -o toolchain.zip "$URL"
-          unzip -q toolchain.zip -d openorbis_raw
-          FIRST=$(ls openorbis_raw | head -1)
-          if [ -d "openorbis_raw/$FIRST/bin" ]; then
-            mv "openorbis_raw/$FIRST" openorbis
+          curl -sL "https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest" > release.json
+
+          ASSET_URL=$(python3 - <<'PYEOF'
+          import json, sys
+          d = json.load(open('release.json'))
+          assets = d.get('assets', [])
+          for terms in [['linux','.tar.gz'],['.tar.gz'],['linux','.zip'],['.zip']]:
+              for a in assets:
+                  n = a['name'].lower()
+                  if all(t in n for t in terms):
+                      print(a['browser_download_url']); sys.exit()
+          PYEOF
+          )
+
+          mkdir -p openorbis /tmp/tc_extract
+
+          if [ -n "$ASSET_URL" ]; then
+            echo "Downloading: $ASSET_URL"
+            wget -q "$ASSET_URL" -O tc_archive
+            if echo "$ASSET_URL" | grep -qE '\.tar\.gz$'; then
+              tar -xzf tc_archive -C /tmp/tc_extract
+            else
+              unzip -q tc_archive -d /tmp/tc_extract
+            fi
           else
-            mv openorbis_raw openorbis
+            echo "No release found — cloning repo"
+            git clone --depth=1 \
+              https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
+              /tmp/tc_extract
           fi
-          chmod +x openorbis/bin/linux/*
+
+          COUNT=$(ls /tmp/tc_extract | wc -l)
+          TOP="/tmp/tc_extract/$(ls /tmp/tc_extract | head -1)"
+          if [ "$COUNT" -eq 1 ] && [ -d "$TOP" ]; then
+            cp -r "$TOP/." openorbis/
+          else
+            cp -r /tmp/tc_extract/. openorbis/
+          fi
+
+          mkdir -p openorbis/bin/linux
+
+          for TOOL in create-fself create-lib create-pkg; do
+            SRC=$(find openorbis -type f -name "$TOOL" ! -path "*/bin/linux/*" 2>/dev/null | head -1)
+            [ -n "$SRC" ] && cp "$SRC" openorbis/bin/linux/
+          done
+
+          if [ -d openorbis/bin ]; then
+            find openorbis/bin -maxdepth 1 -type f \
+              ! -name "*.exe" ! -name "*.bat" ! -name "*.dll" \
+              ! -path "*/bin/linux/*" \
+              -exec cp {} openorbis/bin/linux/ \; 2>/dev/null || true
+          fi
+
+          if ls openorbis/bin/linux/* 2>/dev/null | grep -q .; then
+            chmod +x openorbis/bin/linux/*
+            echo "Tools in bin/linux:"; ls openorbis/bin/linux/
+          else
+            echo "WARNING: bin/linux is empty"
+          fi
+
           echo "OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis" >> $GITHUB_ENV
 
-      - name: Extract zip
+      - name: Extract source zip
         run: unzip RedAngel_RE.zip
 
       - name: Clone GoldHEN SDK
@@ -45,10 +90,14 @@ jobs:
             RedAngel_RE/GoldHEN_Plugins_SDK
 
       - name: Build PRX
-        run: make
+        run: |
+          make
+          if [ -f build/Seren-rebuild.oelf ] && [ ! -f build/Seren-rebuild.prx ]; then
+            cp build/Seren-rebuild.oelf build/Seren-rebuild.prx
+          fi
         working-directory: RedAngel_RE/source
 
-      - name: Upload PRX artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RedAngel-prx
