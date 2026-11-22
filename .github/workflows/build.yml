@@ -1,184 +1,113 @@
-name: Build PRX
+name: Build RedAngel PRX
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    branches: [ main, master ]
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # ── 1. Checkout repo ──────────────────────────────────────────────────
+      - uses: actions/checkout@v4
 
+      # ── 2. Install compiler + linker + archiver ───────────────────────────
       - name: Install build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential clang lld llvm git curl unzip
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-18 lld-18 llvm-18 git unzip
+          # Expose tools under their plain names so Makefiles find them
+          sudo ln -sf /usr/bin/clang-18       /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-18     /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/llvm-ar-18     /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/ld.lld-18      /usr/local/bin/ld.lld
+          clang --version
+          ld.lld --version
+          llvm-ar --version
 
-      - name: Locate and unpack project
-        id: project
-        shell: bash
+      # ── 3. Fix glibc multiarch headers for cross-compile ─────────────────
+      - name: Fix cross-compile headers
         run: |
-          set -euo pipefail
+          sudo cp -rn /usr/include/x86_64-linux-gnu/. /usr/include/ 2>/dev/null || true
 
-          if [[ -f "$GITHUB_WORKSPACE/Makefile" ]]; then
-            project="$GITHUB_WORKSPACE"
-          else
-            archive="$GITHUB_WORKSPACE/RedAngel_RE.zip"
-            if [[ ! -f "$archive" ]]; then
-              echo "::error::No root Makefile or RedAngel_RE.zip found"
-              exit 1
-            fi
-
-            src="$GITHUB_WORKSPACE/.build-src"
-            rm -rf "$src"
-            mkdir -p "$src"
-            unzip -q "$archive" -d "$src"
-
-            makefile="$(find "$src" -type f -name Makefile -print -quit)"
-            if [[ -z "$makefile" ]]; then
-              echo "::error::No Makefile found inside RedAngel_RE.zip"
-              exit 1
-            fi
-            project="$(dirname "$makefile")"
-          fi
-
-          echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
-          echo "dir=$project" >> "$GITHUB_OUTPUT"
-          echo "Using project directory: $project"
-
-      - name: Install OpenOrbis toolchain files
-        shell: bash
+      # ── 4. Download OpenOrbis toolchain (libs + tools + headers) ─────────
+      - name: Get OpenOrbis Toolchain
         run: |
-          set -euo pipefail
+          set -e
 
-          archive="$RUNNER_TEMP/toolchain-llvm-18.tar.gz"
-          extract="$RUNNER_TEMP/openorbis-extract"
-          rm -rf "$extract"
-          mkdir -p "$extract"
-
-          curl -fL --retry 3 \
+          # Tarball has the stub libs and create-fself binary
+          echo "Downloading OpenOrbis tarball..."
+          curl -fsSL \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
-            -o "$archive"
-          tar -xzf "$archive" -C "$extract"
+            -o toolchain.tar.gz
+          TOP=$(tar tzf toolchain.tar.gz | head -1 | cut -d'/' -f1)
+          tar xzf toolchain.tar.gz
+          mv "$TOP" openorbis
+          rm toolchain.tar.gz
 
-          libfile="$(find "$extract" -type f \
-            -path '*/lib/libSceLibcInternal.a' -print -quit)"
-          if [[ -z "$libfile" ]]; then
-            echo "::error::OpenOrbis archive did not contain libSceLibcInternal.a"
-            exit 1
-          fi
-          root="${libfile%/lib/libSceLibcInternal.a}"
-
-          git clone --depth 1 --filter=blob:none --sparse \
-            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
-            "$RUNNER_TEMP/openorbis-headers"
-          git -C "$RUNNER_TEMP/openorbis-headers" sparse-checkout set include/orbis
-
-          mkdir -p "$root/include"
-          rm -rf "$root/include/orbis"
-          cp -a "$RUNNER_TEMP/openorbis-headers/include/orbis" "$root/include/orbis"
-
-          curl -fL --retry 3 \
+          # Linker script (not in tarball, grab directly)
+          echo "Downloading link.x..."
+          curl -fsSL \
             https://raw.githubusercontent.com/OpenOrbis/OpenOrbis-PS4-Toolchain/master/link.x \
-            -o "$root/link.x"
+            -o openorbis/link.x
 
-          for lib in \
-            libSceLibcInternal.a \
-            libkernel.a \
-            libSceSysmodule.a \
-            libSceVideoOut.a \
-            libSceRtc.a
-          do
-            if [[ ! -f "$root/lib/$lib" ]]; then
-              echo "::error::Missing $root/lib/$lib"
-              exit 1
-            fi
-          done
+          # PS4 headers via sparse checkout (only the include/ dir)
+          echo "Cloning PS4 headers..."
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git oo_headers
+          cd oo_headers
+          git sparse-checkout set include
+          cd ..
+          cp -rf oo_headers/include/. openorbis/include/
+          rm -rf oo_headers
 
-          rm -rf "$PROJECT_DIR/openorbis"
-          ln -s "$root" "$PROJECT_DIR/openorbis"
+          # Make all binaries executable
+          find openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
 
-          echo "OO_PS4_TOOLCHAIN=$root" >> "$GITHUB_ENV"
-          if [[ -d "$root/bin" ]]; then
-            echo "$root/bin" >> "$GITHUB_PATH"
-          fi
+          # Verify everything we need is present
+          echo "--- Verifying toolchain ---"
+          ls openorbis/link.x
+          ls openorbis/lib/libSceLibcInternal.a
+          ls openorbis/lib/libkernel.a
+          ls openorbis/bin/linux/create-fself
+          ls openorbis/include/orbis/libkernel.h
+          echo "Toolchain OK"
 
-      - name: Install GoldHEN Plugins SDK
-        shell: bash
+      # ── 5. Unzip the plugin source ────────────────────────────────────────
+      - name: Extract source zip
         run: |
-          set -euo pipefail
+          unzip -q RedAngel_RE.zip
+          ls RedAngel_RE/
 
-          sdk="$RUNNER_TEMP/GoldHEN_Plugins_SDK"
-          rm -rf "$sdk"
-          git clone --depth 1 \
+      # ── 6. Clone GoldHEN SDK next to the source dir ───────────────────────
+      - name: Clone GoldHEN SDK
+        run: |
+          git clone --depth=1 \
             https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git \
-            "$sdk"
+            RedAngel_RE/GoldHEN_Plugins_SDK
 
-          # Normalize artifact locations to the paths used by your Makefile.
-          fix_sdk_paths() {
-            local crt hook
-
-            crt="$(find "$sdk" -type f -name crtprx.o -print -quit || true)"
-            if [[ -n "$crt" && "$crt" != "$sdk/build/crtprx.o" ]]; then
-              mkdir -p "$sdk/build"
-              ln -sfn "$crt" "$sdk/build/crtprx.o"
-            fi
-
-            hook="$(find "$sdk" -type f -name libGoldHEN_Hook.a -print -quit || true)"
-            if [[ -n "$hook" && "$hook" != "$sdk/libGoldHEN_Hook.a" ]]; then
-              ln -sfn "$hook" "$sdk/libGoldHEN_Hook.a"
-            fi
-          }
-
-          fix_sdk_paths
-
-          # Build the SDK's default target if its required files are not already present.
-          if [[ ! -f "$sdk/build/crtprx.o" || ! -f "$sdk/libGoldHEN_Hook.a" ]]; then
-            if [[ -f "$sdk/Makefile" ]]; then
-              make -C "$sdk"
-            fi
-          fi
-
-          fix_sdk_paths
-
-          for required in "$sdk/build/crtprx.o" "$sdk/libGoldHEN_Hook.a"; do
-            if [[ ! -f "$required" ]]; then
-              echo "::error::GoldHEN SDK is missing $required"
-              exit 1
-            fi
-          done
-
-          # Your Makefile refers to the SDK as ../GoldHEN_Plugins_SDK.
-          sdk_link="$(dirname "$PROJECT_DIR")/GoldHEN_Plugins_SDK"
-          rm -rf "$sdk_link"
-          ln -s "$sdk" "$sdk_link"
-
-      - name: Build PRX
-        shell: bash
+      # ── 7. Build GoldHEN SDK (produces crtprx.o + libGoldHEN_Hook.a) ──────
+      - name: Build GoldHEN SDK
         run: |
-          set -euo pipefail
-          cd "$PROJECT_DIR"
-          make
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
+          make -j$(nproc)
+        working-directory: RedAngel_RE/GoldHEN_Plugins_SDK
 
-          prx="$(find . -type f -name '*.prx' -print -quit)"
-          if [[ -z "$prx" ]]; then
-            echo "::error::Build finished but produced no .prx file"
-            exit 1
-          fi
-          find . -type f -name '*.prx' -print
+      # ── 8. Build the PRX ──────────────────────────────────────────────────
+      - name: Build PRX
+        run: |
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
+          make -j$(nproc)
+          echo "--- Build output ---"
+          ls -lh build/
+        working-directory: RedAngel_RE/source
 
-      - name: Upload PRX
+      # ── 9. Upload Seren-rebuild.prx as a downloadable artifact ───────────
+      - name: Upload PRX artifact
         uses: actions/upload-artifact@v4
         with:
-          name: built-prx
-          path: ${{ steps.project.outputs.dir }}/**/*.prx
+          name: Seren-rebuild-prx
+          path: RedAngel_RE/source/build/Seren-rebuild.prx
           if-no-files-found: error
