@@ -18,55 +18,56 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y clang-18 lld-18 llvm-18 git unzip
-          # Expose tools under their plain names so Makefiles find them
-          sudo ln -sf /usr/bin/clang-18       /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-18     /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/llvm-ar-18     /usr/local/bin/llvm-ar
-          sudo ln -sf /usr/bin/ld.lld-18      /usr/local/bin/ld.lld
-          clang --version
-          ld.lld --version
-          llvm-ar --version
+          sudo ln -sf /usr/bin/clang-18   /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/llvm-ar-18 /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/ld.lld-18  /usr/local/bin/ld.lld
 
       # ── 3. Fix glibc multiarch headers for cross-compile ─────────────────
       - name: Fix cross-compile headers
         run: |
           sudo cp -rn /usr/include/x86_64-linux-gnu/. /usr/include/ 2>/dev/null || true
 
-      # ── 4. Download OpenOrbis toolchain (libs + tools + headers) ─────────
+      # ── 4. Download OpenOrbis toolchain ───────────────────────────────────
       - name: Get OpenOrbis Toolchain
         run: |
-          set -e
-
-          # Tarball has the stub libs and create-fself binary
-          echo "Downloading OpenOrbis tarball..."
+          # Download tarball
           curl -fsSL \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
             -o toolchain.tar.gz
-          TOP=$(tar tzf toolchain.tar.gz | head -1 | cut -d'/' -f1)
-          tar xzf toolchain.tar.gz
-          mv "$TOP" openorbis
+
+          # Extract (suppress broken-pipe noise)
+          tar xzf toolchain.tar.gz 2>/dev/null || tar xzf toolchain.tar.gz
+
+          # Find the extracted top-level dir by locating libSceLibcInternal.a
+          LIBPATH=$(find . -maxdepth 5 -name "libSceLibcInternal.a" | head -1)
+          if [ -z "$LIBPATH" ]; then
+            echo "ERROR: libSceLibcInternal.a not found in tarball!"
+            find . -maxdepth 4 -name "*.a" | head -20
+            exit 1
+          fi
+          TOOLDIR=$(echo "$LIBPATH" | cut -d'/' -f2)
+          echo "Toolchain extracted to: $TOOLDIR"
+          mv "$TOOLDIR" openorbis
+
           rm toolchain.tar.gz
 
-          # Linker script (not in tarball, grab directly)
-          echo "Downloading link.x..."
+          # Linker script
           curl -fsSL \
             https://raw.githubusercontent.com/OpenOrbis/OpenOrbis-PS4-Toolchain/master/link.x \
             -o openorbis/link.x
 
-          # PS4 headers via sparse checkout (only the include/ dir)
-          echo "Cloning PS4 headers..."
+          # PS4 headers (sparse checkout, include/ only)
           git clone --depth=1 --filter=blob:none --sparse \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git oo_headers
-          cd oo_headers
-          git sparse-checkout set include
-          cd ..
+          cd oo_headers && git sparse-checkout set include && cd ..
           cp -rf oo_headers/include/. openorbis/include/
           rm -rf oo_headers
 
           # Make all binaries executable
           find openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
 
-          # Verify everything we need is present
+          # Verify
           echo "--- Verifying toolchain ---"
           ls openorbis/link.x
           ls openorbis/lib/libSceLibcInternal.a
@@ -77,18 +78,16 @@ jobs:
 
       # ── 5. Unzip the plugin source ────────────────────────────────────────
       - name: Extract source zip
-        run: |
-          unzip -q RedAngel_RE.zip
-          ls RedAngel_RE/
+        run: unzip -q RedAngel_RE.zip && ls RedAngel_RE/
 
-      # ── 6. Clone GoldHEN SDK next to the source dir ───────────────────────
+      # ── 6. Clone GoldHEN SDK ──────────────────────────────────────────────
       - name: Clone GoldHEN SDK
         run: |
           git clone --depth=1 \
             https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git \
             RedAngel_RE/GoldHEN_Plugins_SDK
 
-      # ── 7. Build GoldHEN SDK (produces crtprx.o + libGoldHEN_Hook.a) ──────
+      # ── 7. Build GoldHEN SDK ──────────────────────────────────────────────
       - name: Build GoldHEN SDK
         run: |
           export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
@@ -104,7 +103,7 @@ jobs:
           ls -lh build/
         working-directory: RedAngel_RE/source
 
-      # ── 9. Upload Seren-rebuild.prx as a downloadable artifact ───────────
+      # ── 9. Upload artifact ────────────────────────────────────────────────
       - name: Upload PRX artifact
         uses: actions/upload-artifact@v4
         with:
