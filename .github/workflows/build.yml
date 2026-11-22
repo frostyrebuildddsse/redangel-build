@@ -1,68 +1,184 @@
-name: Build RedAngel PRX
+name: Build PRX
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install build tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y clang-18 lld llvm-18 git-lfs
-          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/llvm-ar-18 /usr/local/bin/llvm-ar
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang lld llvm git curl unzip
 
-      - name: Fix cross-compile headers
+      - name: Locate and unpack project
+        id: project
+        shell: bash
         run: |
-          sudo cp -rn /usr/include/x86_64-linux-gnu/. /usr/include/ 2>/dev/null || true
+          set -euo pipefail
 
-      - name: Get OpenOrbis Toolchain
+          if [[ -f "$GITHUB_WORKSPACE/Makefile" ]]; then
+            project="$GITHUB_WORKSPACE"
+          else
+            archive="$GITHUB_WORKSPACE/RedAngel_RE.zip"
+            if [[ ! -f "$archive" ]]; then
+              echo "::error::No root Makefile or RedAngel_RE.zip found"
+              exit 1
+            fi
+
+            src="$GITHUB_WORKSPACE/.build-src"
+            rm -rf "$src"
+            mkdir -p "$src"
+            unzip -q "$archive" -d "$src"
+
+            makefile="$(find "$src" -type f -name Makefile -print -quit)"
+            if [[ -z "$makefile" ]]; then
+              echo "::error::No Makefile found inside RedAngel_RE.zip"
+              exit 1
+            fi
+            project="$(dirname "$makefile")"
+          fi
+
+          echo "PROJECT_DIR=$project" >> "$GITHUB_ENV"
+          echo "dir=$project" >> "$GITHUB_OUTPUT"
+          echo "Using project directory: $project"
+
+      - name: Install OpenOrbis toolchain files
+        shell: bash
         run: |
-          # Tarball for libs + tools
-          curl -L \
+          set -euo pipefail
+
+          archive="$RUNNER_TEMP/toolchain-llvm-18.tar.gz"
+          extract="$RUNNER_TEMP/openorbis-extract"
+          rm -rf "$extract"
+          mkdir -p "$extract"
+
+          curl -fL --retry 3 \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
-            -o toolchain.tar.gz
-          TOP=$(tar tzf toolchain.tar.gz | head -1 | cut -d'/' -f1)
-          tar xzf toolchain.tar.gz && mv "$TOP" openorbis
-          # Sparse checkout for headers + link.x only (fast, no binary blobs)
-          git clone --depth=1 --filter=blob:none --sparse \
-            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git oo_headers
-          cd oo_headers && git sparse-checkout set include link.x && cd ..
-          cp -rf oo_headers/include/. openorbis/include/ 2>/dev/null || true
-          cp -f oo_headers/link.x openorbis/ 2>/dev/null || true
-          find openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
+            -o "$archive"
+          tar -xzf "$archive" -C "$extract"
 
-      - name: Extract zip
-        run: unzip RedAngel_RE.zip
+          libfile="$(find "$extract" -type f \
+            -path '*/lib/libSceLibcInternal.a' -print -quit)"
+          if [[ -z "$libfile" ]]; then
+            echo "::error::OpenOrbis archive did not contain libSceLibcInternal.a"
+            exit 1
+          fi
+          root="${libfile%/lib/libSceLibcInternal.a}"
 
-      - name: Clone GoldHEN SDK
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git \
+            "$RUNNER_TEMP/openorbis-headers"
+          git -C "$RUNNER_TEMP/openorbis-headers" sparse-checkout set include/orbis
+
+          mkdir -p "$root/include"
+          rm -rf "$root/include/orbis"
+          cp -a "$RUNNER_TEMP/openorbis-headers/include/orbis" "$root/include/orbis"
+
+          curl -fL --retry 3 \
+            https://raw.githubusercontent.com/OpenOrbis/OpenOrbis-PS4-Toolchain/master/link.x \
+            -o "$root/link.x"
+
+          for lib in \
+            libSceLibcInternal.a \
+            libkernel.a \
+            libSceSysmodule.a \
+            libSceVideoOut.a \
+            libSceRtc.a
+          do
+            if [[ ! -f "$root/lib/$lib" ]]; then
+              echo "::error::Missing $root/lib/$lib"
+              exit 1
+            fi
+          done
+
+          rm -rf "$PROJECT_DIR/openorbis"
+          ln -s "$root" "$PROJECT_DIR/openorbis"
+
+          echo "OO_PS4_TOOLCHAIN=$root" >> "$GITHUB_ENV"
+          if [[ -d "$root/bin" ]]; then
+            echo "$root/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install GoldHEN Plugins SDK
+        shell: bash
         run: |
-          git clone --depth=1 \
+          set -euo pipefail
+
+          sdk="$RUNNER_TEMP/GoldHEN_Plugins_SDK"
+          rm -rf "$sdk"
+          git clone --depth 1 \
             https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git \
-            RedAngel_RE/GoldHEN_Plugins_SDK
+            "$sdk"
 
-      - name: Build GoldHEN SDK
-        run: |
-          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
-          make
-        working-directory: RedAngel_RE/GoldHEN_Plugins_SDK
+          # Normalize artifact locations to the paths used by your Makefile.
+          fix_sdk_paths() {
+            local crt hook
+
+            crt="$(find "$sdk" -type f -name crtprx.o -print -quit || true)"
+            if [[ -n "$crt" && "$crt" != "$sdk/build/crtprx.o" ]]; then
+              mkdir -p "$sdk/build"
+              ln -sfn "$crt" "$sdk/build/crtprx.o"
+            fi
+
+            hook="$(find "$sdk" -type f -name libGoldHEN_Hook.a -print -quit || true)"
+            if [[ -n "$hook" && "$hook" != "$sdk/libGoldHEN_Hook.a" ]]; then
+              ln -sfn "$hook" "$sdk/libGoldHEN_Hook.a"
+            fi
+          }
+
+          fix_sdk_paths
+
+          # Build the SDK's default target if its required files are not already present.
+          if [[ ! -f "$sdk/build/crtprx.o" || ! -f "$sdk/libGoldHEN_Hook.a" ]]; then
+            if [[ -f "$sdk/Makefile" ]]; then
+              make -C "$sdk"
+            fi
+          fi
+
+          fix_sdk_paths
+
+          for required in "$sdk/build/crtprx.o" "$sdk/libGoldHEN_Hook.a"; do
+            if [[ ! -f "$required" ]]; then
+              echo "::error::GoldHEN SDK is missing $required"
+              exit 1
+            fi
+          done
+
+          # Your Makefile refers to the SDK as ../GoldHEN_Plugins_SDK.
+          sdk_link="$(dirname "$PROJECT_DIR")/GoldHEN_Plugins_SDK"
+          rm -rf "$sdk_link"
+          ln -s "$sdk" "$sdk_link"
 
       - name: Build PRX
+        shell: bash
         run: |
-          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
+          set -euo pipefail
+          cd "$PROJECT_DIR"
           make
-        working-directory: RedAngel_RE/source
 
-      - name: Upload PRX artifact
+          prx="$(find . -type f -name '*.prx' -print -quit)"
+          if [[ -z "$prx" ]]; then
+            echo "::error::Build finished but produced no .prx file"
+            exit 1
+          fi
+          find . -type f -name '*.prx' -print
+
+      - name: Upload PRX
         uses: actions/upload-artifact@v4
         with:
-          name: RedAngel-prx
-          path: RedAngel_RE/source/build/Seren-rebuild.prx
+          name: built-prx
+          path: ${{ steps.project.outputs.dir }}/**/*.prx
           if-no-files-found: error
