@@ -7,205 +7,37 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y clang lld curl wget unzip python3
+          sudo apt-get install -y clang-18 lld llvm-18 git-lfs
+          sudo ln -sf /usr/bin/clang-18 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/clang++-18 /usr/local/bin/clang++
+          sudo ln -sf /usr/bin/llvm-ar-18 /usr/local/bin/llvm-ar
+
+      - name: Fix cross-compile headers
+        run: |
+          sudo cp -rn /usr/include/x86_64-linux-gnu/. /usr/include/ 2>/dev/null || true
 
       - name: Get OpenOrbis Toolchain
         run: |
-          curl -sL "https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest" > release.json
-          ASSET_URL=$(python3 - <<'PYEOF'
-          import json, sys
-          d = json.load(open('release.json'))
-          assets = d.get('assets', [])
-          for terms in [['linux','.tar.gz'],['.tar.gz'],['linux','.zip'],['.zip']]:
-              for a in assets:
-                  n = a['name'].lower()
-                  if all(t in n for t in terms):
-                      print(a['browser_download_url']); sys.exit()
-          PYEOF
-          )
-          mkdir -p openorbis /tmp/tc_extract
-          if [ -n "$ASSET_URL" ]; then
-            wget -q "$ASSET_URL" -O tc_archive
-            if echo "$ASSET_URL" | grep -qE '\.tar\.gz$'; then
-              tar -xzf tc_archive -C /tmp/tc_extract
-            else
-              unzip -q tc_archive -d /tmp/tc_extract
-            fi
-          else
-            git clone --depth=1 https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git /tmp/tc_extract
-          fi
-          COUNT=$(ls /tmp/tc_extract | wc -l)
-          TOP="/tmp/tc_extract/$(ls /tmp/tc_extract | head -1)"
-          if [ "$COUNT" -eq 1 ] && [ -d "$TOP" ]; then
-            cp -r "$TOP/." openorbis/
-          else
-            cp -r /tmp/tc_extract/. openorbis/
-          fi
-          mkdir -p openorbis/bin/linux
-          for TOOL in create-fself create-lib create-pkg; do
-            SRC=$(find openorbis -type f -name "$TOOL" ! -path "*/bin/linux/*" 2>/dev/null | head -1)
-            [ -n "$SRC" ] && cp "$SRC" openorbis/bin/linux/
-          done
-          if [ -d openorbis/bin ]; then
-            find openorbis/bin -maxdepth 1 -type f ! -name "*.exe" ! -name "*.bat" ! -name "*.dll" \
-              ! -path "*/bin/linux/*" -exec cp {} openorbis/bin/linux/ \; 2>/dev/null || true
-          fi
-          ls openorbis/bin/linux/* 2>/dev/null && chmod +x openorbis/bin/linux/* || true
-          echo "OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis" >> $GITHUB_ENV
+          git lfs install
+          git clone --depth=1 \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git openorbis
+          curl -L \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
+            -o toolchain.tar.gz
+          TOP=$(tar tzf toolchain.tar.gz | head -1 | cut -d'/' -f1)
+          tar xzf toolchain.tar.gz
+          cp -rf "$TOP"/lib/. openorbis/lib/ 2>/dev/null || true
+          cp -rf "$TOP"/bin/. openorbis/bin/ 2>/dev/null || true
+          find openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
 
-      - name: Inject missing C standard headers into sysroot
-        run: |
-          python3 - <<'PYEOF'
-          import os
-
-          inc = os.environ['OO_PS4_TOOLCHAIN'] + '/include'
-          os.makedirs(inc, exist_ok=True)
-
-          headers = {}
-
-          headers['stdio.h'] = """\
-          #pragma once
-          #ifndef _STDIO_H
-          #define _STDIO_H 1
-          #include <stddef.h>
-          #include <stdarg.h>
-          typedef struct _ps4_FILE FILE;
-          #define EOF (-1)
-          #define SEEK_SET 0
-          #define SEEK_CUR 1
-          #define SEEK_END 2
-          int printf(const char *fmt, ...);
-          int fprintf(FILE *s, const char *fmt, ...);
-          int sprintf(char *b, const char *fmt, ...);
-          int snprintf(char *b, size_t n, const char *fmt, ...);
-          int vprintf(const char *fmt, va_list ap);
-          int vfprintf(FILE *s, const char *fmt, va_list ap);
-          int vsprintf(char *b, const char *fmt, va_list ap);
-          int vsnprintf(char *b, size_t n, const char *fmt, va_list ap);
-          int sscanf(const char *s, const char *fmt, ...);
-          FILE *fopen(const char *path, const char *mode);
-          int fclose(FILE *s);
-          size_t fread(void *p, size_t sz, size_t n, FILE *s);
-          size_t fwrite(const void *p, size_t sz, size_t n, FILE *s);
-          int fseek(FILE *s, long off, int whence);
-          long ftell(FILE *s);
-          void rewind(FILE *s);
-          int fflush(FILE *s);
-          int feof(FILE *s);
-          char *fgets(char *b, int n, FILE *s);
-          int fputs(const char *b, FILE *s);
-          int fputc(int c, FILE *s);
-          int fgetc(FILE *s);
-          int putchar(int c);
-          int puts(const char *s);
-          extern FILE *stdin;
-          extern FILE *stdout;
-          extern FILE *stderr;
-          #endif
-          """
-
-          headers['stdlib.h'] = """\
-          #pragma once
-          #ifndef _STDLIB_H
-          #define _STDLIB_H 1
-          #include <stddef.h>
-          void *malloc(size_t n);
-          void *calloc(size_t n, size_t s);
-          void *realloc(void *p, size_t n);
-          void free(void *p);
-          int abs(int x);
-          long labs(long x);
-          double atof(const char *s);
-          int atoi(const char *s);
-          long atol(const char *s);
-          void exit(int status);
-          int rand(void);
-          void srand(unsigned int seed);
-          void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *));
-          void *bsearch(const void *k, const void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *));
-          #define RAND_MAX 0x7fffffff
-          #define EXIT_SUCCESS 0
-          #define EXIT_FAILURE 1
-          #endif
-          """
-
-          headers['string.h'] = """\
-          #pragma once
-          #ifndef _STRING_H
-          #define _STRING_H 1
-          #include <stddef.h>
-          void *memcpy(void *d, const void *s, size_t n);
-          void *memmove(void *d, const void *s, size_t n);
-          void *memset(void *s, int c, size_t n);
-          int memcmp(const void *a, const void *b, size_t n);
-          void *memchr(const void *s, int c, size_t n);
-          char *strcpy(char *d, const char *s);
-          char *strncpy(char *d, const char *s, size_t n);
-          char *strcat(char *d, const char *s);
-          char *strncat(char *d, const char *s, size_t n);
-          int strcmp(const char *a, const char *b);
-          int strncmp(const char *a, const char *b, size_t n);
-          size_t strlen(const char *s);
-          char *strchr(const char *s, int c);
-          char *strrchr(const char *s, int c);
-          char *strstr(const char *h, const char *n);
-          char *strtok(char *s, const char *d);
-          char *strdup(const char *s);
-          char *strerror(int e);
-          size_t strspn(const char *s, const char *a);
-          size_t strcspn(const char *s, const char *r);
-          int strcasecmp(const char *a, const char *b);
-          int strncasecmp(const char *a, const char *b, size_t n);
-          #endif
-          """
-
-          headers['math.h'] = """\
-          #pragma once
-          #ifndef _MATH_H
-          #define _MATH_H 1
-          #define M_PI 3.14159265358979323846
-          #define M_E  2.71828182845904523536
-          #define INFINITY __builtin_inff()
-          #define NAN      __builtin_nanf("")
-          double sin(double x); double cos(double x); double tan(double x);
-          double asin(double x); double acos(double x); double atan(double x);
-          double atan2(double y, double x);
-          double sqrt(double x); double pow(double b, double e);
-          double exp(double x); double log(double x); double log2(double x); double log10(double x);
-          double fabs(double x); double floor(double x); double ceil(double x);
-          double round(double x); double fmod(double x, double y);
-          float sinf(float x); float cosf(float x); float tanf(float x);
-          float asinf(float x); float acosf(float x); float atanf(float x);
-          float atan2f(float y, float x);
-          float sqrtf(float x); float powf(float b, float e);
-          float expf(float x); float logf(float x); float log2f(float x); float log10f(float x);
-          float fabsf(float x); float floorf(float x); float ceilf(float x);
-          float roundf(float x); float fmodf(float x, float y);
-          #define isnan(x) __builtin_isnan(x)
-          #define isinf(x) __builtin_isinf(x)
-          #define isfinite(x) __builtin_isfinite(x)
-          #endif
-          """
-
-          import textwrap
-          for name, content in headers.items():
-              path = os.path.join(inc, name)
-              if not os.path.exists(path):
-                  with open(path, 'w') as f:
-                      f.write(textwrap.dedent(content))
-                  print(f'Created: {path}')
-              else:
-                  print(f'Already exists: {path}')
-          PYEOF
-
-      - name: Extract source zip
+      - name: Extract zip
         run: unzip RedAngel_RE.zip
 
       - name: Clone GoldHEN SDK
@@ -214,15 +46,19 @@ jobs:
             https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git \
             RedAngel_RE/GoldHEN_Plugins_SDK
 
+      - name: Build GoldHEN SDK
+        run: |
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
+          make
+        working-directory: RedAngel_RE/GoldHEN_Plugins_SDK
+
       - name: Build PRX
         run: |
+          export OO_PS4_TOOLCHAIN=$GITHUB_WORKSPACE/openorbis
           make
-          if [ -f build/Seren-rebuild.oelf ] && [ ! -f build/Seren-rebuild.prx ]; then
-            cp build/Seren-rebuild.oelf build/Seren-rebuild.prx
-          fi
         working-directory: RedAngel_RE/source
 
-      - name: Upload artifact
+      - name: Upload PRX artifact
         uses: actions/upload-artifact@v4
         with:
           name: RedAngel-prx
