@@ -25,16 +25,18 @@ jobs:
 
       - name: Get OpenOrbis Toolchain
         run: |
-          git lfs install
-          git clone --depth=1 \
-            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git openorbis
+          # Tarball for libs + tools
           curl -L \
             https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz \
             -o toolchain.tar.gz
           TOP=$(tar tzf toolchain.tar.gz | head -1 | cut -d'/' -f1)
-          tar xzf toolchain.tar.gz
-          cp -rf "$TOP"/lib/. openorbis/lib/ 2>/dev/null || true
-          cp -rf "$TOP"/bin/. openorbis/bin/ 2>/dev/null || true
+          tar xzf toolchain.tar.gz && mv "$TOP" openorbis
+          # Sparse checkout for headers + link.x only (fast, no binary blobs)
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain.git oo_headers
+          cd oo_headers && git sparse-checkout set include link.x && cd ..
+          cp -rf oo_headers/include/. openorbis/include/ 2>/dev/null || true
+          cp -f oo_headers/link.x openorbis/ 2>/dev/null || true
           find openorbis/bin -type f -exec chmod +x {} \; 2>/dev/null || true
 
       - name: Extract zip
